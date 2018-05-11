@@ -1,0 +1,602 @@
+---
+title: "AG_Project_ar4411_thl312"
+author: "AR"
+date: "5/15/2017"
+output: html_document
+---
+Gene Set Enrichment Analysis of NANOG in Cancerous and Normal Tissue using Bioconductor - limma Package
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(message = FALSE)
+```
+SRA retrieval of FASTQ files
+```{sh, eval=F}
+
+library(RSQLite)
+library(SRAdb)
+
+#this only run once to get SRAmetadb.sqlite.gz
+#getSRAdbFile(destdir = getwd(), destfile = "SRAmetadb.sqlite.gz")
+#got the file SRAmetadb.sqlite in the directory
+
+sqlfile <- 'SRAmetadb.sqlite'
+sra_con <- dbConnect(SQLite(),sqlfile)
+
+# retrieving fastq files from study: https://www.ncbi.nlm.nih.gov/Traces/study/?acc=SRP041005
+
+#download SRR done successfully in /scratch/ar4411/Project
+#getSRAfile(c("SRR1220630","SRR1220631","SRR1220632","SRR1220633","SRR1220634","SRR1220635","SRR1220636"), sra_con, fileType = 'sra' )
+# got .sra files with each accession IDs.
+#single-read: convert sra to fastq
+
+# run separate on commandline via sra-tools
+module load sra-tools/intel/2.8.1-2
+# run this command for all accession IDs.
+fastq-dump  --split-files SRR1220630
+ 
+
+```
+obtain fastqc reports
+```{sh, eval=F}
+#fastqc
+#!/bin/bash
+#SBATCH --job-name=fastqc_ar4411
+#SBATCH --output=fastqc_%A.out
+#SBATCH --error=sra_fastq_%A.err
+#SBATCH -J fastqc
+#SBATCH --cpus-per-task=6
+#SBATCH -n 4
+#SBATCH --time=02:00:00
+#SBATCH --mem=16GB
+
+cd /scratch/ar4411/Project
+module purge
+module load fastqc/0.11.5
+
+#use .fastq files to run fastqc on them
+
+# fastqc *_1.fastq
+
+fastqc SRR1220630_1.fastq
+fastqc SRR1220631_1.fastq
+fastqc SRR1220632_1.fastq
+fastqc SRR1220633_1.fastq
+fastqc SRR1220634_1.fastq
+fastqc SRR1220635_1.fastq
+fastqc SRR1220636_1.fastq
+
+#the output html reports are saved in : /scratch/ar4411/Project/fastqc_report
+#chmod 755 fastqc_report for Thomas.
+
+```
+trimming adaptors, left with about 95-97% of reads afterwards.
+```{sh, eval=F}
+
+#trimmomatic
+
+#!/bin/bash
+#SBATCH --array=0-7
+#SBATCH --job-name=trimmomatic_ar4411
+#SBATCH --output=trim_%A_%a.out
+#SBATCH --error=trim_%A_%a.err
+#SBATCH -J java2
+#SBATCH --cpus-per-task=6
+#SBATCH -n 4
+#SBATCH --time=06:00:00
+#SBATCH --mem=16GB
+
+#this script only performs adaptor trimming function with default settings. Once it is verified that 4 required outputs are being produced, the next script will perform mapping and conversion to bam files.
+
+#loading the required modules in working directory
+cd /scratch/ar4411/Project
+module purge
+module load trimmomatic/0.36
+
+# Input: Its the files containing reads, ending in _1.fastq
+FILE1=($(ls *1.fastq))
+
+
+#how to take input files in parallel
+INPUT1=${FILE1[$SLURM_ARRAY_TASK_ID]}
+
+
+#output is taking the whole input, along with the file extension "fastq". Therefore use %.* to format the files.
+OUTPUT1=${INPUT1%.*}.trim.fastq
+
+
+#using one set of parameters for all files. More than 80% of the reads are recovered after trimming is done.
+#paired files contain more reads / weigh more than unpaired files.
+
+java -jar $TRIMMOMATIC_JAR SE -phred33 $INPUT1 $OUTPUT1 ILLUMINACLIP:TruSeq3-PE.fa:2:30:5:1:true LEADING:3 TRAILING:15 SLIDINGWINDOW:4:15 MINLEN:30
+
+```
+
+alignment to reference genome and bam conversion.
+
+```{sh, eval=F}
+
+#hisat2 and samtools 
+#!/bin/bash
+#SBATCH --array=0-7
+#SBATCH --job-name=hisat2_SE_ar4411
+#SBATCH --output=hisat2_s_%A_%a.out
+#SBATCH --error=hisat2_s_%A_%a.err
+#SBATCH -J hisat2
+#SBATCH --cpus-per-task=6
+#SBATCH -n 16
+#SBATCH --time=06:00:00
+#SBATCH --mem=16GB
+
+#loading the required modules for mapping and conversion to .bam files in working directory.
+# will be using paired output from trimmomatic script.
+cd /scratch/ar4411/Project
+module purge
+module load hisat2/intel/2.0.5
+module load samtools/intel
+
+
+# capture the current input that will be used for first step, and store it in a variable.
+# we are only going to align the paired files since unpaired ones are expected to have much lesser reads,
+# so they will not be processed.
+FILE1=($(ls *_1.trim.fastq))
+
+
+# this is going to assign the variables to file names.
+# all input files should start processing in parallel.
+INPUT1=${FILE1[$SLURM_ARRAY_TASK_ID]}
+
+
+#${f%.*} to get rid of previous file extension.
+OUTPUT=${INPUT1%%.*}.sam
+OUTPUT2=${OUTPUT%.*}.bam
+OUTPUT3=${OUTPUT2%.*}.sorted.bam
+
+# the output sam files might be labeled as _1.sam.
+# outsplice_project contains a list of strand specific coordinates for splice variants.
+
+hisat2 --fr --threads 10 --novel-splicesite-outfile outsplice_project --rna-strandness FR -x mm10/genome $INPUT1 -S $OUTPUT
+
+
+# take the sam file from previous step and convert it to bam
+samtools view -o $OUTPUT2 -b $OUTPUT
+# sorting the bam files
+samtools sort -o $OUTPUT3 $OUTPUT2
+# indexing the bam files
+samtools index $OUTPUT3
+
+# going to use sorted bam files for featureCounts.
+```
+shell script for running featureCounts script on Prince.
+```{sh, eval=F}
+
+#!/bin/bash
+#SBATCH --array=0-6
+#SBATCH --job-name=run_fc_P
+#SBATCH --output=run_fc_%A_%a.out
+#SBATCH --error=run_fc_%A_%a.err
+#SBATCH -J R
+#SBATCH --cpus-per-task=4
+#SBATCH -n 16
+#SBATCH --time=02:00:00
+#SBATCH --mem=16GB
+
+# loading R module to run featureCounts script
+module purge
+module load r/intel/3.3.2
+
+
+cd /scratch/ar4411/Project
+Rscript fc_count_P.R
+
+
+```
+Acutal featureCounts R script (fc_count_P.R)
+```{sh, eval=F}
+#featureCounts
+setwd("/scratch/ar4411/Project")
+
+source("http://bioconductor.org/biocLite.R")
+#biocLite("Rsubread",lib.loc="/scratch/ar4411/HW02")
+library(edgeR)		# need this for rpkm 
+library(Rsubread)	# main library for featureCounts
+library(methods)   	# (also need to include this library when calling on command-line using Rscript)
+
+# set this flag to TRUE to do do a gene-level count, else exon level 
+#do_gene_level = T
+
+# featureCounts currently does not have a function to generate Tpm, so we convert from fpkm to tpm
+fpkmToTpm <- function(fpkm, dolog=T)
+{
+  tpm = log2(fpkm) - log2(sum(fpkm)) + log2(1e6)
+  if (!dolog) 
+  {
+    tpm = (2^tpm)
+  }
+  tpm	
+}
+
+
+#get this from scratch/ar4411/Project
+annof  =  "mm10_genes.gtf"
+
+# A list of BAM files to count over genes
+#upload them as a list. The file extension is .sorted.bam. Not using the indexed files (.bai)
+bamfiles= list.files(pattern="*sorted.bam$")
+
+# featureCounts is the main function to give the counts of reads over each gene in the gtf file
+
+
+{
+  
+  fc_PE_gene <- featureCounts(bamfiles, 
+                              annot.ext = annof,  # gtf file
+                              GTF.attrType="gene_id", # the label in the gtf describing a gene 
+                              nthreads=6,   # use multiple cores for speed
+                              minMQS=20,    # exclude multimapped reads (low MAPQ score) 
+                              countMultiMappingReads = F,
+                              strandSpecific = 0,    # this is not strand-specific data, we are working with both strands(would set to 1 or 2 to take strand into account for Illumina data, depending on strand-specific library construction)
+                              isGTFAnnotationFile=T,
+                              GTF.featureType = "exon",
+                              useMetaFeatures=TRUE, # This indicates we want expression over genes; for exon-level expression set this to FALSE 
+                              primaryOnly=TRUE,  # only include primary mappings
+                              isPairedEnd=FALSE) # this is pair-ended data
+}
+{
+  fc_PE_exon <- featureCounts(bamfiles, 
+                              annot.ext = annof,  # gtf file
+                              GTF.attrType="gene_id", # the label in the gtf describing a gene 
+                              nthreads=5,   # use multiple cores for speed
+                              minMQS=20,    # exclude multimapped reads (low MAPQ score) 
+                              countMultiMappingReads = F,
+                              strandSpecific = 0,    # this is not strand-specific data (would set to 1 or 2 to take strand into account for Illumina data, depending on strand-specific library construction)
+                              isGTFAnnotationFile=T,
+                              GTF.featureType = "exon",
+                              useMetaFeatures=FALSE, # This indicates we want expression over genes; for exon-level expression set this to FALSE 
+                              primaryOnly=TRUE,  # only include primary mappings
+                              isPairedEnd=FALSE) # this is pair-ended data
+}
+
+# fc_PE$counts are the raw read counts overlying the features
+# Note that geneids are given as the row names. REpeat this or take it out?
+head(rownames(fc_PE_gene$counts))
+head(colnames(fc_PE_gene$counts))
+
+head(rownames(fc_PE_exon$counts))
+head(colnames(fc_PE_exon$counts))
+
+# fc_PE$annotation stores extra information on gene location etc.
+
+# This bit of R hackery is just to tidy up the column names by removing the ".bam" extension
+colnames(fc_PE_gene$counts) = gsub(".sorted.bam","", colnames(fc_PE_gene$counts), perl=T)
+head(colnames(fc_PE_gene$counts))
+
+colnames(fc_PE_exon$counts) = gsub(".sorted.bam","", colnames(fc_PE_exon), perl = T)
+head(colnames(fc_PE_exon$counts))
+
+{
+  
+  # For later differential gene expression analysis, all we need is the counts
+  # Here we calculate the expression in units of TPM to order genes by expression and compare expression of genes within one sample.
+  # edgeR has the rpkm function to calculate the (obsolete) RPKM unit, so we use that and then convert to TPM.
+  x_PE <- DGEList(counts=fc_PE_gene$counts, genes=fc_PE_gene$annotation)
+  x_PE_rpkm = rpkm(x_PE,x_PE$genes$Length, log=T)
+  x_PE_rpkm = data.frame(x_PE_rpkm)
+  
+  # convert from RPKM to TPM
+  x_tpm  = fpkmToTpm(2^x_PE_rpkm, dolog=F)
+  #end of gene level
+  
+  
+  # save results in a binary RData file for later processing 
+  save(fc_PE_gene, x_tpm, file="ar4411_gene_P.RData")
+  
+}
+# exon-level this file is not used in the remaining part of project.
+{
+  # (Note: TPM is meaning less for exon-level counts)
+  save(fc_PE_exon, file="ar4411_exon_P.RData")
+  
+}
+```
+
+```{r}
+#install packages the first time
+#source("http://bioconductor.org/biocLite.R")
+#biocLite("limma")
+#biocLite("edgeR")
+#install.packages("dplyr")
+#install.packages("WriteXLS")
+# (Note: under Windows will also need to install Perl)
+#install.packages("dplyr")
+library(dplyr)  # for arrange() function
+library(limma)    # main limma package
+library(edgeR)    # we need the TMM function from edgeR
+library(WriteXLS) # for convenience, we will save the final results as an Excel file
+library("org.Mm.eg.db")
+library(AnnotationDbi)
+library(RColorBrewer)
+```
+differential gene expression by limma
+```{r}
+
+# load raw data- this is the RNA-seq counts per gene. This was calculated using featureCounts. 
+# and also load sample information (stored in data.frame "ss")
+#most of the visualization commands are taken from:
+#Phipson et al., “Differential expression analysis – RNAseq analysis in R” http://combine-australia.github.io/RNAseq-R/06-rnaseq-day1.html
+
+
+load(file=paste("ar4411_gene_P.RData",sep=""))
+
+#confirm replicate number from GEO links.
+ss <- matrix(c("R1", "CTR", "SRR1220630_1", "R2", "CTR", "SRR1220631_1", "R1", "TG", "SRR1220632_1", "R3","CTR", "SRR1220633_1","R2", "TG", "SRR1220634_1","R3", "TG", "SRR1220635_1","R4", "CTR", "SRR1220636_1"),ncol=3,byrow=TRUE)
+colnames(ss) <- c("replicate","treatment", "target")
+ss <- as.data.frame(ss)
+
+# look at the data saved from featureCounts
+colnames(fc_PE_gene$counts)
+dim(fc_PE_gene$counts)
+colnames(fc_PE_gene$annotation)
+dim(fc_PE_gene$annotation)
+
+genelevel_counts <- fc_PE_gene$counts
+
+genelevel_counts <- fc_PE_gene$counts
+
+# convert fc_PE from standard R list to Bioconductor DGEList data structure
+dge <- DGEList(counts=genelevel_counts)
+
+# non-specific filter to remove low count features, so they do not provide false differential expression.
+# By removing these noisy genes early in the pipeline, most later stages perform better e.g. FDR estimation and weight estimation for the weighted linear model.
+
+# (requires > 1 CPM over at least 3 samples)
+isexpr <- rowSums(cpm(dge) > 1) >=3  # a minimum counts per million
+# isexpr <- rowSums(dge$counts > 50) >=3  # or we can use a minimum count
+# check what fraction of genes remain
+table(isexpr)
+
+sum(isexpr)/nrow(dge)
+#0.5385938
+
+
+dge <- dge[isexpr,keep.lib.sizes=FALSE] 
+# keep.lib.sizes=FALSE to force recalculating library sizes from sums of column counts (note: we can also pass in library sizes explicitly)
+
+dim(dge)
+#13153     8
+
+dge$samples$lib.size
+#sizes vary for all samples.
+#8050066  7462106 11654684 12040584  8066913  8327070  7621772
+barplot(dge$samples$lib.size,names=colnames(dge),las=2)
+title("Barplot of library sizes")
+
+# TMM normalization
+dge <- calcNormFactors(dge)
+
+# Get log2 counts per million
+logcounts <- cpm(dge,log=TRUE)
+# Check distributions of samples using boxplots after normalization
+boxplot(logcounts, xlab="", ylab="Log2 counts per million",las=2)
+# add a blue horizontal line that corresponds to the median logCPM
+abline(h=median(logcounts),col="blue")
+title("Boxplots of logCPMs (normalised)")
+
+
+#plotMDS, red samples are TG and blue ones are CTR. The top right blue sample could be negative
+#control.
+levels(ss$treatment)
+col.status <- c("blue","red")[ss$treatment]
+plotMDS(dge,col=col.status) 
+title("By normalized differential gene expression")
+
+#hierarchical clustering
+# We estimate the variance for each row in the logcounts matrix
+var_genes <- apply(logcounts,1,var)
+head(var_genes)
+
+# Get the gene names for the top 500 most variable genes
+select_var <- names(sort(var_genes, decreasing=TRUE))[1:500]
+head(select_var)
+#"Eif2s3y" "Xist"    "Kdm5d"   "Nanog"   "Uty"     "Ltf"
+# Subset logcounts matrix
+highly_variable_lcpm <- logcounts[select_var,]
+dim(highly_variable_lcpm)
+# 500   7
+
+## Get some nicer colours
+mypalette <- brewer.pal(11,"RdYlBu")
+morecols <- colorRampPalette(mypalette)
+# Set up colour vector for celltype variable
+col.cell <- c("purple","orange")[ss$treatment]
+
+# Plot the heatmap - optionally as pdf if it takes too long.
+#png(file="High_var_genes.heatmap_P.png")
+heatmap(highly_variable_lcpm,col=rev(morecols(50)), main="Top 500 most variable genes across samples",ColSideColors=col.cell,scale="row")
+#dev.off()
+
+
+#Intercept refers to CTR
+design <- model.matrix(~treatment, data=ss)
+
+
+# Calculate weights to correct for Poisson count noise due to discrete nature of RNA-seq. This is done by empirically fitting a curve to (and also log converts).
+# This allows us to use a weighted linear model rather than requiring a 
+# more complex generalized linear model of a negative binomial distribution.
+# We are going to assume that data points with very low featureCounts have been removed.Gene-wise means and variances of RNA-seq data are represented by black points with a LOWESS trend in the voom, mean-variance figure. http://genomebiology.biomedcentral.com/articles/10.1186/gb-2014-15-2-r29
+#log of mean counts vs. variance across genes, to provide weights.
+v <- voom(dge,design,plot=TRUE)
+
+
+# lmFit fits linear model across all genes, use weights from voom and assigned numerical values from design matrix.
+
+fit <- lmFit(v,design)
+names(v)
+#"targets" "E"       "weights" "design"
+boxplot(v$E, xlab="", ylab="Log2 counts per million",las=2,main="Voom transformed logCPM")
+abline(h=median(v$E),col="blue")
+# eBayes computes F (overall "omnibus" p-values) and (moderated) t-statistics for all genes
+# (like anova() in base R).
+# eBayes calculates for variance across replicates per gene. It also calculates a pooled estimate of variance across all genes. It can be shown that “shrinking” the variance estimate towards this global estimate, in a mathematically precise way. This can improve power when there are few replicates.
+fit2  <- eBayes(fit)
+colnames(fit2)
+#"(Intercept)" "treatmentTG"
+
+
+names(fit)
+#"coefficients"     "stdev.unscaled"   "sigma"            "df.residual"      "cov.coefficients"
+#"pivot"            "rank"             "Amean"            "method"           "design" 
+
+names(fit2)
+# "coefficients"     "stdev.unscaled"   "sigma"            "df.residual"      "cov.coefficients"
+# "pivot"            "rank"             "Amean"            "method"           "design"          
+# "df.prior"         "s2.prior"         "var.prior"        "proportion"       "s2.post"         
+# "t"                "df.total"         "p.value"          "lods"             "F"               
+#"F.p.value"
+
+
+R_interaction = topTable(fit2, coef="treatmentTG", number=nrow(dge$counts))
+View(R_interaction)
+
+# plots for exploratory data analysis
+# In statistics, a volcano plot is a type of scatter-plot that is used to quickly identify changes in large data sets composed of replicate data. It plots significance versus fold-change on the y and x axes, respectively.
+#Volcano plot of fold change versus the B-statistic for any fitted coefficient.
+volcanoplot(fit2,coef=2L,highlight=50,names=rownames(fit2$p.value))
+title("50 most significant genes based on fold change")
+
+summa.fit <- decideTests(fit2)
+plotMD(fit2, coef=2L, main="plotMD(fit2)", cex=0.5, status = summa.fit[,"(Intercept)"])  
+# MA plot
+# Average log expression vs. log-fold change. green shows negative log expression and red shows neutral values (which is majority of genes).
+
+
+
+plotDensities(v, main="plotDensities(v)",legend=F)
+#plot the overall distribution of gene expression for each sample on a density plot. Shows the curved / smoothed out histogram. 
+# all samples have quite similar density profile with minor diffirences. The legend would not show up completely so it difficult to say which sample is in pink, that deviates the most from group pattern.
+
+
+#to plot one gene's expression in 7 samples. For NANOG, we see overexpression in top 3 samples (TG) and lowe expression in bottom 4 (CTR). The lowest one, close to -4 along y-axis could be negative control.
+nice.col <- brewer.pal(6,name="Dark2")
+stripchart(v$E["Nanog",]~dge$samples$group,vertical=TRUE,las=2,cex.axis=0.8,pch=16,cex=1.3,col=nice.col,method="jitter",ylab="Normalised log2 expression",main="Nanog")
+
+
+# do FDR multiple testing correction and extract list of most significant genes (using Benjamini-Hockberg by default)
+R_interaction = topTable(fit2, coef="treatmentTG", number=nrow(dge$counts)) 
+
+
+# how many significant genes showing interaction are there at FDR of 10% ?
+dim(R_interaction[R_interaction$adj.P.Val <= 0.10,])
+head(R_interaction)
+#download R_interaction as XLS
+WriteXLS("R_interaction",Encoding="latin1",ExcelFileName=paste("diff_gene_P.xls",sep=""),row.names=T, FreezeRow=1,FreezeCol=1,AdjWidth=F)	
+#############################################################################################
+
+```
+Gene set enrichment analysis with c5 GO - genesets.
+```{r message=FALSE}
+options(warn=-1)
+load(file = "mouse_c5.rdata")
+
+# We need to convert from gene symbols to the index of the gene in the data to call the romer().
+
+C2t <- ids2indices(Mm.gmtl.c5, rownames(v))
+#we should repeat the following process for down and mixed list, even though the final xls file will have a list of p-values for all 3.
+
+
+# ideally, should do >= 1000 rotations
+rr <- romer(v,C2t,design = design,contrast=2,nrot=1000)
+#1454 results expected, based on size of c5. filter by top 20
+romerUP_rr=topRomer(rr,n=20,alt="up")
+romerDOWN_rr=topRomer(rr,n=20,alt="down")
+romerMIXED_rr=topRomer(rr,n=20,alt="mixed")
+
+
+write.csv(romerUP_rr,file="romer_UP_c5.csv")
+write.csv(romerDOWN_rr,file="romer_DOWN_c5.csv")
+write.csv(romerMIXED_rr,file="romer_MIXED_c5.csv")
+
+# ROAST
+#1454 observations
+myc.rst <- roast(v,index=C2t,design=design,contrast=2,nrot=1000)
+
+write.csv(myc.rst,file="roast_c5.csv")
+
+# CAMERA
+#1454 observations
+gst.camera <- camera(v,index=C2t,design=design,contrast = 2, inter.gene.cor=0.10)
+
+write.csv(gst.camera,file="camera_c5.csv")
+```
+C2 - curated gene sets
+```{r message=FALSE}
+load(file = "mouse_c2_v5p2.rdata")
+
+#converting Entrez gene IDs from c2 to gene symbols so they are compatible with our topTable.
+library("org.Mm.eg.db")
+library(AnnotationDbi)
+MY_LIST <- Mm.c2
+my_new_list <- list()
+library(org.Mm.eg.db)
+for (name in names(MY_LIST)) {my_new_list[[length(my_new_list)+1]] <- select(org.Mm.eg.db, keys = MY_LIST[[name]], columns = "SYMBOL", keytype = "ENTREZID")$SYMBOL }
+names(my_new_list) <- names(Mm.c2)
+
+#provides a list of 4729 elements.
+C2t <- ids2indices(my_new_list, rownames(v))
+rr <- romer(v,C2t,design = design,contrast=2,nrot=1000)
+
+romerUP_rr_2=topRomer(rr,n=20,alt="up")
+romerDOWN_rr_2=topRomer(rr,n=20,alt="down")
+romerMIXED_rr_2=topRomer(rr,n=20,alt="mixed")
+
+
+write.csv(romerUP_rr,file="romer_UP_c2.csv")
+write.csv(romerDOWN_rr,file="romer_DOWN_c2.csv")
+write.csv(romerMIXED_rr,file="romer_MIXED_c2.csv")
+
+# ROAST
+myc.rst2 <- roast(v,index=C2t,design=design,nrot=1000)
+
+write.csv(myc.rst2,file="roast_c2.csv")
+
+# CAMERA
+
+gst.camera2 <- camera(v,index=C2t,design=design,inter.gene.cor=0.10)
+
+write.csv(gst.camera2,file="camera_c2.csv")
+```
+H - Hallmark gene sets
+```{r message=FALSE}
+load(file = "mouse_H_v5p2.rdata")
+library("org.Mm.eg.db")
+library(AnnotationDbi)
+MY_LIST2 <- Mm.H
+my_new_list2 <- list()
+library(org.Mm.eg.db)
+for (name in names(MY_LIST2)) {my_new_list2[[length(my_new_list2)+1]] <- select(org.Mm.eg.db, keys = MY_LIST2[[name]], columns = "SYMBOL", keytype = "ENTREZID")$SYMBOL }
+names(my_new_list2) <- names(Mm.H)
+
+#provides a list of 50 groups
+C2t <- ids2indices(my_new_list2, rownames(v))
+rr <- romer(v,C2t,design = design,contrast=2,nrot=1000)
+
+romerUP_rr_H=topRomer(rr,n=20,alt="up")
+romerDOWN_rr_H=topRomer(rr,n=20,alt="down")
+romerMIXED_rr_H=topRomer(rr,n=20,alt="mixed")
+
+write.csv(romerUP_rr,file="romer_UP_H.csv")
+write.csv(romerDOWN_rr,file="romer_DOWN_H.csv")
+write.csv(romerMIXED_rr,file="romer_MIXED_H.csv")
+
+# ROAST
+#maybe we can improve the results by increasing nrot, but it stil doesn't bring "EMT" to up-regulated within acceptable p-value range.
+# when nrot is 10,000; the p-value goes form 0.24 to 0.20.
+myc.rst3 <- roast(v,index=C2t,design=design,nrot=1000)
+
+write.csv(myc.rst3,file="roast_H.csv")
+
+# CAMERA
+# p-value of gene sets become more significant by changing inter.gene.cor to 0.05 and below.
+gst.camera3 <- camera(v,index=C2t,design=design,inter.gene.cor=0.10)
+
+```
